@@ -1,0 +1,331 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Audit des partages reseau trop permissifs sur un serveur Windows.
+
+.DESCRIPTION
+    Analyse tous les partages SMB et detecte les permissions trop permissives
+    (lecture/ecriture pour Everyone, Authenticated Users, Domain Users, etc.).
+    Fonctionne en local SANS WinRM grace au fallback WMI/Net Share.
+
+.PARAMETER ComputerName
+    Nom(s) du/des serveur(s) a auditer. Par defaut : serveur local.
+
+.PARAMETER OutputCsv
+    Chemin du fichier CSV de sortie.
+
+.PARAMETER IncludeAdminShares
+    Inclure les partages administratifs (C$, ADMIN$, IPC$, etc.).
+
+.EXAMPLE
+    .\Audit-NetworkShares.ps1
+    .\Audit-NetworkShares.ps1 -ComputerName "SRV01","SRV02"
+    .\Audit-NetworkShares.ps1 -IncludeAdminShares
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(ValueFromPipeline)]
+    [string[]]$ComputerName = $env:COMPUTERNAME,
+
+    [string]$OutputCsv = ".\ShareAudit_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv",
+
+    [switch]$IncludeAdminShares
+)
+
+# ------------------------------------------------------------------
+# Groupes consideres comme trop permissifs
+# ------------------------------------------------------------------
+$PermissiveIdentities = @(
+    "Everyone",
+    "Tout le monde",
+    "Authenticated Users",
+    "Utilisateurs authentifies",
+    "BUILTIN\Users",
+    "Domain Users",
+    "Utilisateurs du domaine",
+    "NT AUTHORITY\Authenticated Users",
+    "NT AUTHORITY\INTERACTIVE",
+    "Creator Owner",
+    "BUILTIN\Guests",
+    "Guests"
+)
+
+$DangerousRights = @("FullControl","Change","Write","Modify","GenericAll","GenericWrite")
+
+$AdminSharePattern = '^([A-Z]\$|ADMIN\$|IPC\$|PRINT\$|NETLOGON|SYSVOL|FAX\$|print\$)$'
+
+# ------------------------------------------------------------------
+# Fonctions
+# ------------------------------------------------------------------
+function Get-RiskLevel {
+    param([string]$AccessRight, [string]$Identity)
+    $isPermissive = $PermissiveIdentities | Where-Object { $Identity -like "*$_*" }
+    if (-not $isPermissive) { return "OK" }
+    foreach ($right in $DangerousRights) {
+        if ($AccessRight -like "*$right*") { return "CRITIQUE" }
+    }
+    if ($AccessRight -like "*Read*" -or $AccessRight -like "*List*") { return "MOYEN" }
+    return "FAIBLE"
+}
+
+function Get-LocalShares {
+    # Fallback local via WMI (pas besoin de WinRM)
+    try {
+        $shares = Get-WmiObject -Class Win32_Share -ErrorAction Stop
+        return $shares
+    } catch {
+        # Dernier recours : net share
+        $netOutput = net share 2>$null
+        $shares = @()
+        foreach ($line in $netOutput) {
+            if ($line -match '^(\S+)\s+(C:\\[^\s]+|[A-Z]:\\[^\s]*)\s') {
+                $shares += [PSCustomObject]@{ Name = $Matches[1]; Path = $Matches[2] }
+            }
+        }
+        return $shares
+    }
+}
+
+function Get-SharePermissionsLocal {
+    param([string]$ShareName)
+    $results = @()
+    try {
+        # SmbShare en local ne necessite pas CimSession
+        $smbPerms = Get-SmbShareAccess -Name $ShareName -ErrorAction Stop
+        foreach ($perm in $smbPerms) {
+            $risk = Get-RiskLevel -AccessRight $perm.AccessRight -Identity $perm.AccountName
+            $results += [PSCustomObject]@{
+                Serveur     = $env:COMPUTERNAME
+                Partage     = $ShareName
+                Chemin      = ""
+                Type        = "SMB"
+                Identite    = $perm.AccountName
+                Droit       = $perm.AccessRight
+                TypeAcces   = $perm.AccessControlType
+                Risque      = $risk
+                Commentaire = ""
+            }
+        }
+    } catch {
+        $results += [PSCustomObject]@{
+            Serveur     = $env:COMPUTERNAME
+            Partage     = $ShareName
+            Chemin      = ""
+            Type        = "SMB"
+            Identite    = "ERREUR"
+            Droit       = $_.Exception.Message
+            TypeAcces   = ""
+            Risque      = "INCONNU"
+            Commentaire = "Impossible de lire les permissions SMB"
+        }
+    }
+    return $results
+}
+
+function Get-SharePermissionsRemote {
+    param([string]$Computer, [string]$ShareName)
+    $results = @()
+    try {
+        $smbPerms = Get-SmbShareAccess -Name $ShareName -CimSession $Computer -ErrorAction Stop
+        foreach ($perm in $smbPerms) {
+            $risk = Get-RiskLevel -AccessRight $perm.AccessRight -Identity $perm.AccountName
+            $results += [PSCustomObject]@{
+                Serveur     = $Computer
+                Partage     = $ShareName
+                Chemin      = ""
+                Type        = "SMB"
+                Identite    = $perm.AccountName
+                Droit       = $perm.AccessRight
+                TypeAcces   = $perm.AccessControlType
+                Risque      = $risk
+                Commentaire = ""
+            }
+        }
+    } catch {
+        $results += [PSCustomObject]@{
+            Serveur     = $Computer
+            Partage     = $ShareName
+            Chemin      = ""
+            Type        = "SMB"
+            Identite    = "ERREUR"
+            Droit       = $_.Exception.Message
+            TypeAcces   = ""
+            Risque      = "INCONNU"
+            Commentaire = "Permissions SMB inaccessibles (WinRM requis)"
+        }
+    }
+    return $results
+}
+
+function Get-NTFSPermissions {
+    param([string]$UNCPath, [string]$Computer, [string]$ShareName, [string]$SharePath)
+    $results = @()
+    try {
+        $acl = Get-Acl -Path $UNCPath -ErrorAction Stop
+        foreach ($ace in $acl.Access) {
+            $identity = $ace.IdentityReference.ToString()
+            $rights   = $ace.FileSystemRights.ToString()
+            $risk     = Get-RiskLevel -AccessRight $rights -Identity $identity
+            if ($risk -ne "OK") {
+                $results += [PSCustomObject]@{
+                    Serveur     = $Computer
+                    Partage     = $ShareName
+                    Chemin      = $SharePath
+                    Type        = "NTFS"
+                    Identite    = $identity
+                    Droit       = $rights
+                    TypeAcces   = $ace.AccessControlType
+                    Risque      = $risk
+                    Commentaire = if ($ace.IsInherited) { "Herite" } else { "Explicite" }
+                }
+            }
+        }
+    } catch {
+        Write-Verbose "NTFS non accessible pour $UNCPath : $_"
+    }
+    return $results
+}
+
+# ------------------------------------------------------------------
+# Banniere
+# ------------------------------------------------------------------
+Write-Host ""
+Write-Host "==========================================================" -ForegroundColor Cyan
+Write-Host "   AUDIT DES PARTAGES RESEAU - WINDOWS"                    -ForegroundColor Cyan
+Write-Host "   Detection des permissions trop permissives"             -ForegroundColor Cyan
+Write-Host "==========================================================" -ForegroundColor Cyan
+Write-Host ""
+
+# ------------------------------------------------------------------
+# Traitement
+# ------------------------------------------------------------------
+$allResults  = @()
+$totalShares = 0
+$isLocal     = ($ComputerName.Count -eq 1 -and
+                ($ComputerName[0] -eq $env:COMPUTERNAME -or $ComputerName[0] -eq "localhost" -or $ComputerName[0] -eq "."))
+
+foreach ($computer in $ComputerName) {
+    Write-Host "> Analyse de : $computer" -ForegroundColor Yellow
+
+    $localMode = ($computer -eq $env:COMPUTERNAME -or $computer -eq "localhost" -or $computer -eq ".")
+
+    if ($localMode) {
+        Write-Host "  Mode LOCAL (sans WinRM)" -ForegroundColor Gray
+        $wmiShares = Get-LocalShares
+
+        if (-not $IncludeAdminShares) {
+            $wmiShares = $wmiShares | Where-Object { $_.Name -notmatch $AdminSharePattern }
+        }
+
+        Write-Host "  $(@($wmiShares).Count) partage(s) trouve(s)" -ForegroundColor Gray
+
+        foreach ($share in $wmiShares) {
+            $totalShares++
+            $sharePath = if ($share.Path) { $share.Path } else { "" }
+            Write-Host "  +-- $($share.Name) ($sharePath)" -ForegroundColor Gray
+
+            $smbRes = Get-SharePermissionsLocal -ShareName $share.Name
+            $smbRes | ForEach-Object { $_.Chemin = $sharePath }
+
+            # NTFS en local via chemin direct
+            $ntfsRes = @()
+            if ($sharePath -and (Test-Path $sharePath -ErrorAction SilentlyContinue)) {
+                $ntfsRes = Get-NTFSPermissions -UNCPath $sharePath -Computer $computer -ShareName $share.Name -SharePath $sharePath
+            }
+
+            $combined = @($smbRes) + @($ntfsRes)
+            $allResults += $combined
+
+            $critiques = $combined | Where-Object { $_.Risque -eq "CRITIQUE" }
+            if ($critiques) {
+                Write-Host "    [!] $($critiques.Count) permission(s) CRITIQUE(s)" -ForegroundColor Red
+            }
+        }
+    }
+    else {
+        # Mode distant
+        if (-not (Test-Connection -ComputerName $computer -Count 1 -Quiet -ErrorAction SilentlyContinue)) {
+            Write-Warning "  Impossible de joindre $computer. Serveur ignore."
+            continue
+        }
+
+        try {
+            $shares = Get-SmbShare -CimSession $computer -ErrorAction Stop
+            if (-not $IncludeAdminShares) {
+                $shares = $shares | Where-Object { $_.Name -notmatch $AdminSharePattern }
+            }
+            Write-Host "  $($shares.Count) partage(s) trouve(s)" -ForegroundColor Gray
+
+            foreach ($share in $shares) {
+                $totalShares++
+                Write-Host "  +-- $($share.Name) ($($share.Path))" -ForegroundColor Gray
+
+                $smbRes  = Get-SharePermissionsRemote -Computer $computer -ShareName $share.Name
+                $smbRes | ForEach-Object { $_.Chemin = $share.Path }
+
+                $uncPath = "\\$computer\$($share.Name)"
+                $ntfsRes = Get-NTFSPermissions -UNCPath $uncPath -Computer $computer -ShareName $share.Name -SharePath $share.Path
+
+                $combined = @($smbRes) + @($ntfsRes)
+                $allResults += $combined
+
+                $critiques = $combined | Where-Object { $_.Risque -eq "CRITIQUE" }
+                if ($critiques) {
+                    Write-Host "    [!] $($critiques.Count) permission(s) CRITIQUE(s)" -ForegroundColor Red
+                }
+            }
+        } catch {
+            Write-Warning "  Erreur sur $computer : $_"
+        }
+    }
+}
+
+# ------------------------------------------------------------------
+# Rapport console
+# ------------------------------------------------------------------
+Write-Host ""
+Write-Host "==========================================================" -ForegroundColor Cyan
+Write-Host "  RESUME DE L'AUDIT"                                        -ForegroundColor Cyan
+Write-Host "==========================================================" -ForegroundColor Cyan
+Write-Host "  Serveurs analyses : $($ComputerName.Count)"
+Write-Host "  Partages analyses : $totalShares"
+Write-Host "  Entrees au total  : $($allResults.Count)"
+Write-Host ""
+
+$byCriticite = $allResults | Group-Object Risque
+foreach ($group in ($byCriticite | Sort-Object Name)) {
+    $color = switch ($group.Name) {
+        "CRITIQUE" { "Red" }
+        "MOYEN"    { "Yellow" }
+        "FAIBLE"   { "Cyan" }
+        default    { "Gray" }
+    }
+    Write-Host "  $($group.Name.PadRight(10)) : $($group.Count) entree(s)" -ForegroundColor $color
+}
+
+Write-Host ""
+
+$critiques = $allResults | Where-Object { $_.Risque -eq "CRITIQUE" }
+if ($critiques) {
+    Write-Host "  PERMISSIONS CRITIQUES :" -ForegroundColor Red
+    Write-Host "----------------------------------------------------------" -ForegroundColor Red
+    $critiques | Format-Table Serveur, Partage, Type, Identite, Droit, TypeAcces -AutoSize
+}
+
+# ------------------------------------------------------------------
+# Export CSV
+# ------------------------------------------------------------------
+if ($allResults.Count -gt 0) {
+    try {
+        $allResults | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8 -Delimiter ";"
+        Write-Host "  Rapport CSV : $OutputCsv" -ForegroundColor Green
+    } catch {
+        Write-Warning "  Export CSV impossible : $_"
+    }
+} else {
+    Write-Host "  Aucun resultat a exporter." -ForegroundColor Gray
+}
+
+Write-Host ""
+return $allResults
