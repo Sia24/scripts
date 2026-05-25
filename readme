@@ -1,0 +1,38 @@
+# Serveur local
+.\Audit-NetworkShares.ps1
+
+# Un ou plusieurs serveurs distants
+.\Audit-NetworkShares.ps1 -ComputerName "SRV01","SRV02"
+
+# Inclure les partages admin (C$, ADMIN$...)
+.\Audit-NetworkShares.ps1 -ComputerName "SRV01" -IncludeAdminShares
+
+# Fichier CSV personnalisé
+.\Audit-NetworkShares.ps1 -ComputerName "SRV01" -OutputCsv "C:\Audit\result.csv"Ce que fait le script :
+Détection des permissions — Il analyse deux couches de sécurité :
+
+SMB (permissions au niveau du partage) via Get-SmbShare / Get-SmbShareAccess
+NTFS (permissions au niveau du système de fichiers) via Get-Acl
+
+Groupes surveillés comme trop permissifs : Everyone, Authenticated Users, BUILTIN\Users, Domain Users, Guests, etc.
+Niveaux de risque :
+
+🔴 CRITIQUE — FullControl, Change, Write, Modify accordé à un groupe permissif
+🟡 MOYEN — Read/List accordé à un groupe permissif
+🔵 FAIBLE — Autres droits faibles sur groupe permissif
+
+
+Utilisation :
+powershell# Serveur local
+.\Audit-NetworkShares.ps1
+
+# Un ou plusieurs serveurs distants
+.\Audit-NetworkShares.ps1 -ComputerName "SRV01","SRV02"
+
+# Inclure les partages admin (C$, ADMIN$...)
+.\Audit-NetworkShares.ps1 -ComputerName "SRV01" -IncludeAdminShares
+
+# Fichier CSV personnalisé
+.\Audit-NetworkShares.ps1 -ComputerName "SRV01" -OutputCsv "C:\Audit\result.csv"
+Prérequis :
+
