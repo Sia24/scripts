@@ -36,3 +36,5 @@ powershell# Serveur local
 .\Audit-NetworkShares.ps1 -ComputerName "SRV01" -OutputCsv "C:\Audit\result.csv"
 Prérequis :
 
+
+(Get-Content file.ps1) -replace '[\u201C\u201D]', '"' | Set-Content file.ps1
