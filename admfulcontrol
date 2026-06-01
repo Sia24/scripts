@@ -1,0 +1,367 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Detecte les processus lances par un compte administrateur qui possede
+    personnellement le privilege FullControl sur l'executable du processus.
+
+.DESCRIPTION
+    Ce script est concu pour etre deploye via Salt Stack sur plusieurs serveurs.
+    Il analyse uniquement la machine locale et retourne les resultats.
+
+    Logique de detection :
+        1. Recupere tous les processus en cours
+        2. Identifie le compte proprietaire de chaque processus
+        3. Verifie si ce compte est membre d'un groupe admin
+        4. Verifie si CE MEME compte a personnellement FullControl sur l'executable
+        5. Flag CRITIQUE uniquement si les deux conditions sont reunies
+
+    Salt deployment examples:
+        salt -G 'os:Windows' cmd.script salt://scripts/Get-AdminFullControlProcesses.ps1 shell=powershell
+        salt -G 'os:Windows' cmd.script salt://scripts/Get-AdminFullControlProcesses.ps1 args="-OutputToConsole -OutputFormat JSON" shell=powershell
+        salt -G 'os:Windows' cmd.script salt://scripts/Get-AdminFullControlProcesses.ps1 args="-OutputPath C:\Temp\audit.csv" shell=powershell
+
+.PARAMETER OutputPath
+    Chemin du fichier CSV de sortie sur la machine locale.
+    Defaut : C:\Temp\AdminFullControlProcesses_<date>.csv
+
+.PARAMETER OutputFormat
+    Format de sortie pour Salt : TEXT (defaut), JSON, CSV
+
+.PARAMETER OutputToConsole
+    Affiche les resultats sur stdout (Salt capture stdout).
+
+.PARAMETER DebugMode
+    Affiche le detail de chaque processus analyse.
+
+.PARAMETER TestMode
+    Lance les verifications de validation du script.
+
+.PARAMETER AdminGroups
+    Liste des groupes consideres comme admin.
+
+.EXAMPLE
+    .\Get-AdminFullControlProcesses.ps1
+    .\Get-AdminFullControlProcesses.ps1 -DebugMode
+    .\Get-AdminFullControlProcesses.ps1 -TestMode
+    .\Get-AdminFullControlProcesses.ps1 -OutputToConsole -OutputFormat JSON
+#>
+
+[CmdletBinding()]
+param(
+    [string]$OutputPath = "C:\Users\dell\Downloads\AdminFullControlProcesses_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv",
+
+    [ValidateSet("TEXT", "JSON", "CSV")]
+    [string]$OutputFormat = "TEXT",
+
+    [switch]$OutputToConsole,
+    [switch]$DebugMode,
+    [switch]$TestMode,
+
+    [string[]]$AdminGroups = @(
+        "Administrators",
+        "Administrateurs",
+        "Domain Admins",
+        "Enterprise Admins",
+        "Schema Admins"
+    )
+)
+
+#region --- Configuration ---
+$ErrorActionPreference = "SilentlyContinue"
+$ServerName = $env:COMPUTERNAME
+$results    = [System.Collections.Generic.List[PSObject]]::new()
+#endregion
+
+#region --- Fonctions ---
+
+function Write-DebugMsg {
+    param([string]$Message, [string]$Color = "DarkGray")
+    if ($DebugMode) {
+        Write-Host "  [DEBUG] $Message" -ForegroundColor $Color
+    }
+}
+
+function Test-IsAdminAccount {
+    param([string]$AccountName)
+
+    $cleanName = $AccountName -replace '^.*\\', ''
+    Write-DebugMsg "Verification admin pour : '$cleanName'"
+
+    # Methode 1 : net localgroup
+    foreach ($group in $AdminGroups) {
+        try {
+            $members = net localgroup $group 2>$null
+            if ($members -match [regex]::Escape($cleanName)) {
+                Write-DebugMsg "'$cleanName' trouve dans '$group' via net localgroup" "Green"
+                return $true
+            }
+        }
+        catch { }
+    }
+
+    # Methode 2 : ADSI (fallback plus fiable)
+    foreach ($group in $AdminGroups) {
+        try {
+            $grp     = [ADSI]"WinNT://$ServerName/$group,group"
+            $members = @($grp.Invoke("Members")) | ForEach-Object {
+                $_.GetType().InvokeMember("Name", "GetProperty", $null, $_, $null)
+            }
+            if ($members -contains $cleanName) {
+                Write-DebugMsg "'$cleanName' trouve dans '$group' via ADSI" "Green"
+                return $true
+            }
+        }
+        catch { }
+    }
+
+    Write-DebugMsg "'$cleanName' n'est pas dans un groupe admin"
+    return $false
+}
+
+function Test-AccountHasFullControl {
+    <#
+    .SYNOPSIS
+        Verifie si UN COMPTE SPECIFIQUE a FullControl sur un fichier.
+        Cross-check entre le proprietaire du processus et les ACLs du fichier.
+    #>
+    param(
+        [string]$FilePath,
+        [string]$AccountName
+    )
+
+    try {
+        if (-not (Test-Path $FilePath)) {
+            Write-DebugMsg "  Fichier introuvable : $FilePath"
+            return $false
+        }
+
+        # Normaliser le nom du compte pour la comparaison
+        # Ex: "MONDOMAINE\jean.dupont" → on garde les deux formes pour comparer
+        $cleanName  = $AccountName -replace '^.*\\', ''        # "jean.dupont"
+        $fullName   = $AccountName                              # "MONDOMAINE\jean.dupont"
+        $builtinMap = @{
+            "SYSTEM"        = "NT AUTHORITY\SYSTEM"
+            "LOCAL SERVICE" = "NT AUTHORITY\LOCAL SERVICE"
+        }
+
+        $acl = Get-Acl -Path $FilePath -ErrorAction SilentlyContinue
+        if (-not $acl) { return $false }
+
+        foreach ($ace in $acl.Access) {
+            # On ne s'interesse qu'aux entrees Allow + FullControl
+            if ($ace.AccessControlType -ne "Allow") { continue }
+            if ($ace.FileSystemRights -notmatch "FullControl") { continue }
+
+            $identity = $ace.IdentityReference.ToString()
+
+            Write-DebugMsg "  ACE FullControl trouvee : '$identity'"
+
+            # Comparaison directe nom complet  ex: DOMAIN\jean.dupont
+            if ($identity -like "*\$cleanName") {
+                Write-DebugMsg "  MATCH sur nom court '$cleanName'" "Yellow"
+                return $true
+            }
+
+            # Comparaison nom complet exact
+            if ($identity -eq $fullName) {
+                Write-DebugMsg "  MATCH sur nom complet '$fullName'" "Yellow"
+                return $true
+            }
+
+            # Verifier si l'ACE est un groupe dont le compte est membre
+            # Ex: BUILTIN\Administrators a FullControl et jean.dupont est admin
+            $identityClean = $identity -replace '^.*\\', ''
+            if ($AdminGroups -contains $identityClean -or
+                $identity -match "Administrators|Administrateurs|BUILTIN\\Admin") {
+                # Si le compte est admin ET que les admins ont FullControl then match
+                if (Test-IsAdminAccount -AccountName $AccountName) {
+                    Write-DebugMsg "  MATCH via groupe admin '$identity'" "Yellow"
+                    return $true
+                }
+            }
+        }
+
+        Write-DebugMsg "  Aucun FullControl personnel trouve pour '$cleanName'"
+        return $false
+    }
+    catch {
+        Write-DebugMsg "  Erreur lecture ACL : $_" "Red"
+        return $false
+    }
+}
+
+function Get-LocalProcesses {
+    try {
+        return Get-WmiObject Win32_Process | Select-Object `
+            ProcessId,
+            Name,
+            ExecutablePath,
+            @{N='Owner'; E={
+                $o = $_.GetOwner()
+                if ($o.ReturnValue -eq 0) { "$($o.Domain)\$($o.User)" } else { "SYSTEM" }
+            }},
+            CommandLine,
+            CreationDate
+    }
+    catch {
+        Write-Warning "Impossible de recuperer les processus : $_"
+        return $null
+    }
+}
+
+#endregion
+
+
+
+#region --- Script Principal ---
+
+if ($TestMode) {
+    Invoke-TestMode
+    exit
+}
+
+Write-Host "============================================================" -ForegroundColor Yellow
+Write-Host "  Analyse Admin + FullControl personnel - $ServerName" -ForegroundColor Yellow
+Write-Host "  Date : $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')" -ForegroundColor Yellow
+if ($DebugMode)       { Write-Host "  MODE DEBUG ACTIF" -ForegroundColor Magenta }
+if ($OutputToConsole) { Write-Host "  SORTIE CONSOLE : $OutputFormat" -ForegroundColor Cyan }
+Write-Host "============================================================`n" -ForegroundColor Yellow
+
+$processes = Get-LocalProcesses
+if (-not $processes) {
+    Write-Warning "Aucun processus recupere. Arret."
+    exit 1
+}
+
+Write-Host "[INFO] $($processes.Count) processus recuperes sur $ServerName`n" -ForegroundColor Cyan
+
+$foundCount   = 0
+$skippedCount = 0
+
+foreach ($proc in $processes) {
+    $owner = $proc.Owner
+
+    # Ignorer les comptes systeme
+    if ([string]::IsNullOrWhiteSpace($owner) -or
+        $owner -match "^(NT AUTHORITY|SYSTEM|LOCAL SERVICE|NETWORK SERVICE)" -or
+        $owner -eq "\") {
+        $skippedCount++
+        Write-DebugMsg "SKIP (systeme) : $($proc.Name) | Owner: '$owner'"
+        continue
+    }
+
+    Write-DebugMsg "Analyse : $($proc.Name) (PID $($proc.ProcessId)) | Owner: $owner" "White"
+
+    # Etape 1 : le compte est-il admin ?
+    $isAdmin = Test-IsAdminAccount -AccountName $owner
+
+    if (-not $isAdmin) {
+        Write-DebugMsg "  Non-admin, on passe" "DarkGray"
+        continue
+    }
+
+    Write-DebugMsg "  Compte admin confirme" "Green"
+
+    # Etape 2 : ce compte admin a-t-il personnellement FullControl sur l'exe ?
+    $hasPersonalFC = $false
+    if ($proc.ExecutablePath) {
+        $hasPersonalFC = Test-AccountHasFullControl -FilePath $proc.ExecutablePath -AccountName $owner
+    }
+    else {
+        Write-DebugMsg "  Pas de chemin executable (processus kernel ou protege)"
+    }
+
+    # Statut final
+    $statut = if ($hasPersonalFC) { "CRITIQUE" } else { "ADMIN" }
+
+    $entry = [PSCustomObject]@{
+        Serveur          = $ServerName
+        ProcessID        = $proc.ProcessId
+        ProcessNom       = $proc.Name
+        CompteOwner      = $owner
+        EstAdmin         = $isAdmin
+        CheminExe        = $proc.ExecutablePath
+        OwnerAFullControl = $hasPersonalFC
+        CommandLine      = ($proc.CommandLine -replace '\s+', ' ')
+        Statut           = $statut
+        DateAnalyse      = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+    }
+
+    $results.Add($entry)
+    $foundCount++
+
+    $color = if ($statut -eq "CRITIQUE") { "Red" } else { "Yellow" }
+    $flag  = if ($hasPersonalFC) { "[CRITIQUE] Admin + FullControl personnel" } else { "[ADMIN] Compte admin" }
+
+    Write-Host "  $flag" -ForegroundColor $color
+ 
+    Write-Host "    PID $($proc.ProcessId) - $($proc.Name) - Owner: $owner" -ForegroundColor $color
+    if ($proc.ExecutablePath) {
+        Write-Host "   Exe : $($proc.ExecutablePath)" -ForegroundColor DarkGray
+    }
+    Write-Host ""
+}
+
+
+
+#endregion
+
+
+#region --- Export et Sortie ---
+
+Write-Host "============================================================" -ForegroundColor Yellow
+Write-Host "  RESUME  $ServerName " -ForegroundColor Yellow
+Write-Host "============================================================" -ForegroundColor Yellow
+
+$critique  = @($results | Where-Object { $_.Statut -eq "CRITIQUE" })
+$adminOnly = @($results | Where-Object { $_.Statut -eq "ADMIN" })
+
+Write-Host "  Processus analyses    : $($processes.Count)" -ForegroundColor White
+Write-Host "  Comptes admin detectes: $($results.Count)" -ForegroundColor Yellow
+Write-Host "  Processus CRITIQUES   : $($critique.Count)  (admin + FullControl personnel)" -ForegroundColor Red
+Write-Host "  Processus ADMIN       : $($adminOnly.Count)  (admin sans FullControl personnel)" -ForegroundColor Yellow
+
+# Export CSV
+if ($OutputPath -and $results.Count -gt 0) {
+    try {
+        $dir = Split-Path $OutputPath -Parent
+        if ($dir -and -not (Test-Path $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        $results | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+        Write-Host "`n[OK] Fichier CSV exporte : $OutputPath" -ForegroundColor Green
+    }
+    catch {
+        Write-Warning "Impossible d'ecrire le fichier CSV : $_"
+    }
+}
+
+# Sortie console pour Salt
+if ($OutputToConsole) {
+    Write-Host "`n--- SALT OUTPUT BEGIN ---"
+    if ($results.Count -gt 0) {
+        switch ($OutputFormat) {
+            "JSON" { $results | ConvertTo-Json -Compress | Write-Output }
+            "CSV"  { $results | ConvertTo-Csv -NoTypeInformation | Write-Output }
+            default { $results | Format-Table -AutoSize | Out-String | Write-Output }
+        }
+    }
+    else {
+        Write-Output "{""Serveur"":""$ServerName"",""Statut"":""CONFORME"",""CritiqueCount"":0,""AdminCount"":0}"
+    }
+    Write-Host "--- SALT OUTPUT END ---"
+}
+
+if ($results.Count -eq 0) {
+    Write-Host "`n[OK] Aucun compte admin detecte sur les processus. Machine conforme." -ForegroundColor Green
+    Write-Host "     => -DebugMode pour voir le detail de l'analyse." -ForegroundColor DarkGray
+    Write-Host "     => -TestMode  pour valider le fonctionnement." -ForegroundColor DarkGray
+}
+
+
+Write-Host "============================================================`n" -ForegroundColor Yellow
+
+# Exit code pour Salt : 0=conforme, 1=critique detecte
+if ($critique.Count -gt 0) { exit 1 } else { exit 0 }
+#endregion
+
