@@ -15,14 +15,19 @@
         4. Verifie si CE MEME compte a personnellement FullControl sur l'executable
         5. Flag CRITIQUE uniquement si les deux conditions sont reunies
 
+    Structure des dossiers crees automatiquement :
+        C:\AuditSentinel\
+            Logs\   → fichiers journaux horodates (.log)
+            *.csv   → fichiers de resultats horodates (toujours crees)
+
     Salt deployment examples:
         salt -G 'os:Windows' cmd.script salt://scripts/Get-AdminFullControlProcesses.ps1 shell=powershell
         salt -G 'os:Windows' cmd.script salt://scripts/Get-AdminFullControlProcesses.ps1 args="-OutputToConsole -OutputFormat JSON" shell=powershell
-        salt -G 'os:Windows' cmd.script salt://scripts/Get-AdminFullControlProcesses.ps1 args="-OutputPath C:\Temp\audit.csv" shell=powershell
+        salt -G 'os:Windows' cmd.script salt://scripts/Get-AdminFullControlProcesses.ps1 args="-OutputPath C:\AuditSentinel\audit.csv" shell=powershell
 
 .PARAMETER OutputPath
     Chemin du fichier CSV de sortie sur la machine locale.
-    Defaut : C:\Temp\AdminFullControlProcesses_<date>.csv
+    Defaut : C:\AuditSentinel\AdminFullControlProcesses_<hostname>_<date>.csv
 
 .PARAMETER OutputFormat
     Format de sortie pour Salt : TEXT (defaut), JSON, CSV
@@ -48,7 +53,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$OutputPath = "C:\Users\dell\Downloads\AdminFullControlProcesses_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv",
+    [string]$OutputPath = "",   # Defini dynamiquement apres creation du dossier
 
     [ValidateSet("TEXT", "JSON", "CSV")]
     [string]$OutputFormat = "TEXT",
@@ -68,8 +73,38 @@ param(
 
 #region --- Configuration ---
 $ErrorActionPreference = "SilentlyContinue"
-$ServerName = $env:COMPUTERNAME
-$results    = [System.Collections.Generic.List[PSObject]]::new()
+$ServerName  = $env:COMPUTERNAME
+$RunStamp    = Get-Date -Format 'yyyyMMdd_HHmmss'
+$results     = [System.Collections.Generic.List[PSObject]]::new()
+
+# --- Dossier racine AuditSentinel ---
+$AuditRoot   = "C:\AuditSentinel"
+$LogsDir     = Join-Path $AuditRoot "Logs"
+
+foreach ($dir in @($AuditRoot, $LogsDir)) {
+    if (-not (Test-Path $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+}
+
+# Chemin CSV par defaut si non fourni en parametre
+if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+    $OutputPath = Join-Path $AuditRoot "AdminFullControlProcesses_${ServerName}_${RunStamp}.csv"
+}
+
+# Fichier journal de la session
+$LogFile = Join-Path $LogsDir "AuditSentinel_${ServerName}_${RunStamp}.log"
+
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message"
+    Add-Content -Path $LogFile -Value $line -Encoding UTF8
+}
+
+Write-Log "Demarrage de l'analyse sur $ServerName"
+Write-Log "Dossier de sortie : $AuditRoot"
+Write-Log "Fichier CSV       : $OutputPath"
+Write-Log "Fichier log       : $LogFile"
 #endregion
 
 #region --- Fonctions ---
@@ -79,6 +114,7 @@ function Write-DebugMsg {
     if ($DebugMode) {
         Write-Host "  [DEBUG] $Message" -ForegroundColor $Color
     }
+    Write-Log $Message "DEBUG"
 }
 
 function Test-IsAdminAccount {
@@ -135,20 +171,13 @@ function Test-AccountHasFullControl {
             return $false
         }
 
-        # Normaliser le nom du compte pour la comparaison
-        # Ex: "MONDOMAINE\jean.dupont" → on garde les deux formes pour comparer
-        $cleanName  = $AccountName -replace '^.*\\', ''        # "jean.dupont"
-        $fullName   = $AccountName                              # "MONDOMAINE\jean.dupont"
-        $builtinMap = @{
-            "SYSTEM"        = "NT AUTHORITY\SYSTEM"
-            "LOCAL SERVICE" = "NT AUTHORITY\LOCAL SERVICE"
-        }
+        $cleanName  = $AccountName -replace '^.*\\', ''
+        $fullName   = $AccountName
 
         $acl = Get-Acl -Path $FilePath -ErrorAction SilentlyContinue
         if (-not $acl) { return $false }
 
         foreach ($ace in $acl.Access) {
-            # On ne s'interesse qu'aux entrees Allow + FullControl
             if ($ace.AccessControlType -ne "Allow") { continue }
             if ($ace.FileSystemRights -notmatch "FullControl") { continue }
 
@@ -156,24 +185,19 @@ function Test-AccountHasFullControl {
 
             Write-DebugMsg "  ACE FullControl trouvee : '$identity'"
 
-            # Comparaison directe nom complet  ex: DOMAIN\jean.dupont
             if ($identity -like "*\$cleanName") {
                 Write-DebugMsg "  MATCH sur nom court '$cleanName'" "Yellow"
                 return $true
             }
 
-            # Comparaison nom complet exact
             if ($identity -eq $fullName) {
                 Write-DebugMsg "  MATCH sur nom complet '$fullName'" "Yellow"
                 return $true
             }
 
-            # Verifier si l'ACE est un groupe dont le compte est membre
-            # Ex: BUILTIN\Administrators a FullControl et jean.dupont est admin
             $identityClean = $identity -replace '^.*\\', ''
             if ($AdminGroups -contains $identityClean -or
                 $identity -match "Administrators|Administrateurs|BUILTIN\\Admin") {
-                # Si le compte est admin ET que les admins ont FullControl then match
                 if (Test-IsAdminAccount -AccountName $AccountName) {
                     Write-DebugMsg "  MATCH via groupe admin '$identity'" "Yellow"
                     return $true
@@ -205,12 +229,12 @@ function Get-LocalProcesses {
     }
     catch {
         Write-Warning "Impossible de recuperer les processus : $_"
+        Write-Log "Impossible de recuperer les processus : $_" "ERROR"
         return $null
     }
 }
 
 #endregion
-
 
 
 #region --- Script Principal ---
@@ -223,6 +247,8 @@ if ($TestMode) {
 Write-Host "============================================================" -ForegroundColor Yellow
 Write-Host "  Analyse Admin + FullControl personnel - $ServerName" -ForegroundColor Yellow
 Write-Host "  Date : $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')" -ForegroundColor Yellow
+Write-Host "  Dossier AuditSentinel : $AuditRoot" -ForegroundColor Cyan
+Write-Host "  Logs : $LogFile" -ForegroundColor Cyan
 if ($DebugMode)       { Write-Host "  MODE DEBUG ACTIF" -ForegroundColor Magenta }
 if ($OutputToConsole) { Write-Host "  SORTIE CONSOLE : $OutputFormat" -ForegroundColor Cyan }
 Write-Host "============================================================`n" -ForegroundColor Yellow
@@ -230,10 +256,12 @@ Write-Host "============================================================`n" -For
 $processes = Get-LocalProcesses
 if (-not $processes) {
     Write-Warning "Aucun processus recupere. Arret."
+    Write-Log "Aucun processus recupere. Arret." "ERROR"
     exit 1
 }
 
 Write-Host "[INFO] $($processes.Count) processus recuperes sur $ServerName`n" -ForegroundColor Cyan
+Write-Log "$($processes.Count) processus recuperes"
 
 $foundCount   = 0
 $skippedCount = 0
@@ -241,7 +269,6 @@ $skippedCount = 0
 foreach ($proc in $processes) {
     $owner = $proc.Owner
 
-    # Ignorer les comptes systeme
     if ([string]::IsNullOrWhiteSpace($owner) -or
         $owner -match "^(NT AUTHORITY|SYSTEM|LOCAL SERVICE|NETWORK SERVICE)" -or
         $owner -eq "\") {
@@ -271,20 +298,19 @@ foreach ($proc in $processes) {
         Write-DebugMsg "  Pas de chemin executable (processus kernel ou protege)"
     }
 
-    # Statut final
     $statut = if ($hasPersonalFC) { "CRITIQUE" } else { "ADMIN" }
 
     $entry = [PSCustomObject]@{
-        Serveur          = $ServerName
-        ProcessID        = $proc.ProcessId
-        ProcessNom       = $proc.Name
-        CompteOwner      = $owner
-        EstAdmin         = $isAdmin
-        CheminExe        = $proc.ExecutablePath
+        Serveur           = $ServerName
+        ProcessID         = $proc.ProcessId
+        ProcessNom        = $proc.Name
+        CompteOwner       = $owner
+        EstAdmin          = $isAdmin
+        CheminExe         = $proc.ExecutablePath
         OwnerAFullControl = $hasPersonalFC
-        CommandLine      = ($proc.CommandLine -replace '\s+', ' ')
-        Statut           = $statut
-        DateAnalyse      = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        CommandLine       = ($proc.CommandLine -replace '\s+', ' ')
+        Statut            = $statut
+        DateAnalyse       = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
     }
 
     $results.Add($entry)
@@ -294,15 +320,14 @@ foreach ($proc in $processes) {
     $flag  = if ($hasPersonalFC) { "[CRITIQUE] Admin + FullControl personnel" } else { "[ADMIN] Compte admin" }
 
     Write-Host "  $flag" -ForegroundColor $color
- 
     Write-Host "    PID $($proc.ProcessId) - $($proc.Name) - Owner: $owner" -ForegroundColor $color
     if ($proc.ExecutablePath) {
         Write-Host "   Exe : $($proc.ExecutablePath)" -ForegroundColor DarkGray
     }
     Write-Host ""
+
+    Write-Log "$flag | PID $($proc.ProcessId) | $($proc.Name) | Owner: $owner | Exe: $($proc.ExecutablePath)"
 }
-
-
 
 #endregion
 
@@ -321,19 +346,34 @@ Write-Host "  Comptes admin detectes: $($results.Count)" -ForegroundColor Yellow
 Write-Host "  Processus CRITIQUES   : $($critique.Count)  (admin + FullControl personnel)" -ForegroundColor Red
 Write-Host "  Processus ADMIN       : $($adminOnly.Count)  (admin sans FullControl personnel)" -ForegroundColor Yellow
 
-# Export CSV
-if ($OutputPath -and $results.Count -gt 0) {
-    try {
-        $dir = Split-Path $OutputPath -Parent
-        if ($dir -and -not (Test-Path $dir)) {
-            New-Item -ItemType Directory -Path $dir -Force | Out-Null
-        }
+Write-Log "RESUME : $($processes.Count) analyses | $($critique.Count) CRITIQUES | $($adminOnly.Count) ADMIN"
+
+# --- Export CSV : TOUJOURS cree, meme si machine conforme ---
+try {
+    if ($results.Count -gt 0) {
         $results | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-        Write-Host "`n[OK] Fichier CSV exporte : $OutputPath" -ForegroundColor Green
     }
-    catch {
-        Write-Warning "Impossible d'ecrire le fichier CSV : $_"
+    else {
+        # Machine conforme : on cree quand meme le fichier avec une ligne de traçabilite
+        [PSCustomObject]@{
+            Serveur           = $ServerName
+            ProcessID         = ""
+            ProcessNom        = ""
+            CompteOwner       = ""
+            EstAdmin          = ""
+            CheminExe         = ""
+            OwnerAFullControl = ""
+            CommandLine       = ""
+            Statut            = "CONFORME"
+            DateAnalyse       = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        } | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
     }
+    Write-Host "`n[OK] Fichier CSV exporte : $OutputPath" -ForegroundColor Green
+    Write-Log "Fichier CSV exporte : $OutputPath"
+}
+catch {
+    Write-Warning "Impossible d'ecrire le fichier CSV : $_"
+    Write-Log "Impossible d'ecrire le fichier CSV : $_" "ERROR"
 }
 
 # Sortie console pour Salt
@@ -358,10 +398,9 @@ if ($results.Count -eq 0) {
     Write-Host "     => -TestMode  pour valider le fonctionnement." -ForegroundColor DarkGray
 }
 
-
+Write-Log "Fin de l'analyse. Exit code : $(if ($critique.Count -gt 0) { 1 } else { 0 })"
 Write-Host "============================================================`n" -ForegroundColor Yellow
 
 # Exit code pour Salt : 0=conforme, 1=critique detecte
 if ($critique.Count -gt 0) { exit 1 } else { exit 0 }
 #endregion
-
